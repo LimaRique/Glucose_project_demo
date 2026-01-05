@@ -1,0 +1,148 @@
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass
+from typing import Dict, List
+
+
+# =========================================================
+# Metabolic State
+# =========================================================
+
+@dataclass
+class MetabolicState:
+    glucose: float
+    glucose_trend: float
+    variability: float
+    risk_level: str
+
+
+def infer_metabolic_state(glucose_series: pd.Series) -> MetabolicState:
+    delta = glucose_series.diff().iloc[-1]
+    variability = glucose_series.rolling(6).std().iloc[-1]
+
+    if glucose_series.iloc[-1] > 180:
+        risk = "high"
+    elif glucose_series.iloc[-1] < 70:
+        risk = "low"
+    else:
+        risk = "normal"
+
+    return MetabolicState(
+        glucose=glucose_series.iloc[-1],
+        glucose_trend=delta,
+        variability=variability,
+        risk_level=risk
+    )
+
+
+# =========================================================
+# Nutritional Context (abstracted)
+# =========================================================
+
+def build_nutritional_constraints(state: MetabolicState) -> Dict:
+    constraints = {
+        "calories": (400, 700),
+        "carbs": (30, 80),
+        "protein": (20, 50),
+        "fat": (10, 30)
+    }
+
+    if state.risk_level == "high":
+        constraints["carbs"] = (20, 50)
+
+    if state.glucose_trend > 0:
+        constraints["carbs"] = (constraints["carbs"][0], 40)
+
+    return constraints
+
+
+# =========================================================
+# Meal Generator (safe abstraction)
+# =========================================================
+
+FOOD_POOL = {
+    "carbs": ["rice", "sweet_potato", "oats"],
+    "protein": ["chicken", "fish", "eggs"],
+    "fat": ["olive_oil", "avocado", "nuts"]
+}
+
+
+def generate_meal(constraints: Dict) -> Dict:
+    meal = {
+        "carbs": np.random.choice(FOOD_POOL["carbs"]),
+        "protein": np.random.choice(FOOD_POOL["protein"]),
+        "fat": np.random.choice(FOOD_POOL["fat"]),
+        "macros": {
+            "carbs": np.random.randint(*constraints["carbs"]),
+            "protein": np.random.randint(*constraints["protein"]),
+            "fat": np.random.randint(*constraints["fat"]),
+        }
+    }
+
+    meal["calories"] = (
+        meal["macros"]["carbs"] * 4 +
+        meal["macros"]["protein"] * 4 +
+        meal["macros"]["fat"] * 9
+    )
+
+    return meal
+
+
+# =========================================================
+# Validation & Rebalancing
+# =========================================================
+
+def validate_meal(meal: Dict, constraints: Dict) -> bool:
+    return (
+        constraints["calories"][0]
+        <= meal["calories"]
+        <= constraints["calories"][1]
+    )
+
+
+def rebalance_meal(meal: Dict, constraints: Dict) -> Dict:
+    for _ in range(5):
+        if validate_meal(meal, constraints):
+            return meal
+        meal = generate_meal(constraints)
+    raise ValueError("Unable to generate valid meal under constraints")
+
+
+# =========================================================
+# Diet Agent
+# =========================================================
+
+class GenerativeDietAgent:
+    def __init__(self):
+        self.history: List[Dict] = []
+
+    def step(self, glucose_series: pd.Series) -> Dict:
+        state = infer_metabolic_state(glucose_series)
+        constraints = build_nutritional_constraints(state)
+
+        meal = generate_meal(constraints)
+        meal = rebalance_meal(meal, constraints)
+
+        output = {
+            "metabolic_state": state.__dict__,
+            "meal_plan": meal
+        }
+
+        self.history.append(output)
+        return output
+
+
+# =========================================================
+# Execution Demo
+# =========================================================
+
+if __name__ == "__main__":
+    glucose_data = pd.Series(
+        [110, 118, 125, 132, 140, 145, 150],
+        name="glucose"
+    )
+
+    agent = GenerativeDietAgent()
+
+    recommendation = agent.step(glucose_data)
+    print(recommendation)
