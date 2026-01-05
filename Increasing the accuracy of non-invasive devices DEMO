@@ -1,0 +1,182 @@
+import pandas as pd
+import numpy as np
+
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from xgboost import XGBRegressor
+
+
+# ======================================
+# Utils
+# ======================================
+
+def rmse(y_true, y_pred):
+    return np.sqrt(mean_squared_error(y_true, y_pred))
+
+
+def evaluate(y_true, y_pred):
+    return {
+        "rmse": rmse(y_true, y_pred),
+        "mae": mean_absolute_error(y_true, y_pred)
+    }
+
+
+# ======================================
+# Feature Engineering
+# ======================================
+
+def add_time_features(df):
+    df = df.copy()
+    df["hour"] = df["timestamp"].dt.hour
+    df["dayofweek"] = df["timestamp"].dt.dayofweek
+    return df
+
+
+def add_lag_features(df, cols, lags=(1, 2, 3)):
+    df = df.copy()
+    for col in cols:
+        for lag in lags:
+            df[f"{col}_lag_{lag}"] = df[col].shift(lag)
+    return df
+
+
+def add_rolling_features(df, cols, windows=(3, 6)):
+    df = df.copy()
+    for col in cols:
+        for w in windows:
+            df[f"{col}_roll_mean_{w}"] = df[col].rolling(w).mean()
+            df[f"{col}_roll_std_{w}"] = df[col].rolling(w).std()
+    return df
+
+
+def add_delta_features(df, cols):
+    df = df.copy()
+    for col in cols:
+        df[f"{col}_delta"] = df[col] - df[col].shift(1)
+    return df
+
+
+def build_features(df):
+    df = df.sort_values("timestamp").copy()
+
+    df = add_time_features(df)
+    df = add_lag_features(df, ["glucose", "carbs", "insulin"])
+    df = add_rolling_features(df, ["glucose"])
+    df = add_delta_features(df, ["glucose"])
+
+    return df.dropna()
+
+
+# ======================================
+# Model
+# ======================================
+
+def build_model():
+    return XGBRegressor(
+        n_estimators=200,
+        max_depth=4,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        objective="reg:squarederror",
+        random_state=42
+    )
+
+
+# ======================================
+# Validation Strategies
+# ======================================
+
+def time_series_cv(X, y, n_splits=4):
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    metrics = []
+
+    for train_idx, test_idx in tscv.split(X):
+        model = build_model()
+        model.fit(X.iloc[train_idx], y.iloc[train_idx])
+
+        preds = model.predict(X.iloc[test_idx])
+        metrics.append(evaluate(y.iloc[test_idx], preds))
+
+    return metrics
+
+
+def holdout_last_window(X, y, window_size=0.2):
+    split = int(len(X) * (1 - window_size))
+
+    model = build_model()
+    model.fit(X.iloc[:split], y.iloc[:split])
+
+    preds = model.predict(X.iloc[split:])
+    return evaluate(y.iloc[split:], preds)
+
+
+# ======================================
+# Ablation Study (vitrine forte)
+# ======================================
+
+def ablation_study(df):
+    results = {}
+
+    feature_sets = {
+        "baseline_lags": ["glucose_lag_1", "glucose_lag_2"],
+        "lags_plus_time": [
+            "glucose_lag_1", "glucose_lag_2", "hour", "dayofweek"
+        ],
+        "full_demo_set": [
+            col for col in df.columns
+            if col not in ["glucose", "timestamp", "patient_id"]
+        ]
+    }
+
+    for name, features in feature_sets.items():
+        X = df[features]
+        y = df["glucose"]
+
+        metrics = time_series_cv(X, y)
+        results[name] = {
+            "rmse_mean": float(np.mean([m["rmse"] for m in metrics])),
+            "rmse_std": float(np.std([m["rmse"] for m in metrics]))
+        }
+
+    return results
+
+
+# ======================================
+# Pipeline
+# ======================================
+
+def run_pipeline(df):
+    df = build_features(df)
+
+    X = df.drop(columns=["glucose", "timestamp", "patient_id"])
+    y = df["glucose"]
+
+    cv_metrics = time_series_cv(X, y)
+    holdout_metrics = holdout_last_window(X, y)
+
+    ablation_results = ablation_study(df)
+
+    return {
+        "cv_rmse_mean": float(np.mean([m["rmse"] for m in cv_metrics])),
+        "cv_rmse_std": float(np.std([m["rmse"] for m in cv_metrics])),
+        "holdout": holdout_metrics,
+        "ablation": ablation_results
+    }
+
+
+# ======================================
+# Execution
+# ======================================
+
+if __name__ == "__main__":
+    df = pd.read_csv(
+        "synthetic_glucose_data.csv",
+        parse_dates=["timestamp"]
+    )
+
+    results = run_pipeline(df)
+
+    for k, v in results.items():
+        print(f"\n{k.upper()}")
+        print(v)
