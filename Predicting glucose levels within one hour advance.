@@ -1,0 +1,149 @@
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from xgboost import XGBRegressor
+
+
+# ======================================
+# Feature Engineering
+# ======================================
+
+def build_time_features(df):
+    df = df.copy()
+    df["hour"] = df["timestamp"].dt.hour
+    df["minute"] = df["timestamp"].dt.minute
+    df["dayofweek"] = df["timestamp"].dt.dayofweek
+    return df
+
+
+def build_lag_features(df, col="glucose", lags=(1, 2, 3, 6)):
+    for lag in lags:
+        df[f"{col}_lag_{lag}"] = df[col].shift(lag)
+    return df
+
+
+def build_rolling_features(df, col="glucose", window=3):
+    df[f"{col}_roll_mean"] = df[col].rolling(window).mean().shift(1)
+    df[f"{col}_roll_std"] = df[col].rolling(window).std().shift(1)
+    df[f"{col}_delta"] = df[col] - df[f"{col}_lag_1"]
+    return df
+
+
+def build_physiological_interactions(df):
+    df["temp_x_hr"] = df["temperature"] * df["heart_rate"]
+    df["hr_div_spo2"] = df["heart_rate"] / (df["spo2"] + 1e-6)
+    df["risk_flag"] = ((df["heart_rate"] > 85) & (df["spo2"] < 96)).astype(int)
+    return df
+
+
+def build_features(df):
+    df = df.sort_values("timestamp").copy()
+
+    df = build_time_features(df)
+    df = build_lag_features(df)
+    df = build_rolling_features(df)
+    df = build_physiological_interactions(df)
+
+    return df.dropna()
+
+
+# ======================================
+# Optional clustering (contextual signal)
+# ======================================
+
+def add_context_cluster(df, features, n_clusters=4):
+    scaler = StandardScaler()
+    X = scaler.fit_transform(df[features])
+
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    df["context_cluster"] = kmeans.fit_predict(X)
+
+    return df
+
+
+# ======================================
+# Forecast target
+# ======================================
+
+def build_target(df, horizon_minutes=30, step_minutes=5):
+    shift = horizon_minutes // step_minutes
+    df["target_glucose"] = df["glucose"].shift(-shift)
+    return df.dropna()
+
+
+# ======================================
+# Model
+# ======================================
+
+def build_model():
+    return XGBRegressor(
+        n_estimators=300,
+        max_depth=5,
+        learning_rate=0.03,
+        subsample=0.7,
+        colsample_bytree=0.7,
+        objective="reg:squarederror",
+        random_state=42
+    )
+
+
+# ======================================
+# Training & Evaluation
+# ======================================
+
+def evaluate(y_true, y_pred):
+    return {
+        "mae": mean_absolute_error(y_true, y_pred),
+        "rmse": np.sqrt(mean_squared_error(y_true, y_pred)),
+        "r2": r2_score(y_true, y_pred)
+    }
+
+
+def run_pipeline(df, horizon_minutes=30):
+    df = build_features(df)
+
+    df = add_context_cluster(
+        df,
+        features=["glucose_delta", "glucose_roll_std", "heart_rate", "spo2"]
+    )
+
+    df = build_target(df, horizon_minutes=horizon_minutes)
+
+    X = df.drop(columns=["glucose", "target_glucose", "timestamp", "patient_id"])
+    y = df["target_glucose"]
+
+    tscv = TimeSeriesSplit(n_splits=4)
+    metrics = []
+
+    for train_idx, test_idx in tscv.split(X):
+        model = build_model()
+        model.fit(X.iloc[train_idx], y.iloc[train_idx])
+
+        preds = model.predict(X.iloc[test_idx])
+        metrics.append(evaluate(y.iloc[test_idx], preds))
+
+    return {
+        "horizon_min": horizon_minutes,
+        "mae_mean": float(np.mean([m["mae"] for m in metrics])),
+        "rmse_mean": float(np.mean([m["rmse"] for m in metrics])),
+        "r2_mean": float(np.mean([m["r2"] for m in metrics]))
+    }
+
+
+# ======================================
+# Execution
+# ======================================
+
+if __name__ == "__main__":
+    df = pd.read_csv(
+        "synthetic_glucose_timeseries.csv",
+        parse_dates=["timestamp"]
+    )
+
+    for horizon in [15, 30, 60]:
+        results = run_pipeline(df, horizon_minutes=horizon)
+        print(results)
